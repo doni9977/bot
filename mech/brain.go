@@ -757,7 +757,7 @@ func (b *Brain) step(o *Obs, act *Action) {
 		if b.P.FinishHP > 0 {
 			finHP = b.P.FinishHP
 		}
-		if keep := b.P; b.P.Finish > 0 && foe.HP < finHP*foe.MaxHP && hpFrac > 0.42 && crowd <= 2 {
+		if keep := b.P; b.P.Finish > 0 && foe.HP < finHP*foe.MaxHP && hpFrac > 0.42 && crowd <= 2 && laser == nil {
 			b.P.GunRange, b.P.LaserRange, b.P.LightRange = b.P.Finish, b.P.Finish, b.P.Finish
 			mx, my = b.fightMove(o, foe, seen, wantLos)
 			b.P = keep
@@ -1357,10 +1357,10 @@ func (b *Brain) prefRange(me *Self, t *Track) float64 {
 	_, laser := hasWeapon(me.Weapons, "laser")
 	r := b.P.GunRange
 	switch {
-	case light != nil && me.Energy > 12:
-		r = b.P.LightRange
 	case laser != nil:
 		r = b.P.LaserRange
+	case light != nil && me.Energy > 12:
+		r = b.P.LightRange
 	}
 	if t.Kind == "npc" {
 		return 58
@@ -1380,6 +1380,9 @@ func (b *Brain) fightMove(o *Obs, tg *Track, seen []*Track, wantLos float64) (fl
 	me := &o.Self
 	x, y := me.Pos[0], me.Pos[1]
 	rp := b.prefRange(me, tg)
+	if zr := o.Zone.NextRadius; zr > 0 && rp > zr*1.6 {
+		rp = math.Max(35, zr*1.5)
+	}
 	bx, by := tg.Pos[0]-x, tg.Pos[1]-y
 	bd := hyp(bx, by) + 1e-9
 	ux, uy := bx/bd, by/bd
