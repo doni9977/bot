@@ -1,324 +1,378 @@
 """
-ApexSurvivor v4 - Ghost Protocol
-Core philosophy: SURVIVAL ABOVE ALL. Against a 15-bot squad that shares vision
-and hunts you, the winning move is to run, hide, and only fight when cornered.
+ApexSurvivor v5 - Aggressive Kiter
 
-Key changes from v3:
-- Removed whisker obstacle avoidance (caused erratic movement, hurt score)
-- Removed low-HP chasing (lured bot into squad ambushes)
-- Much more aggressive fleeing from multiple enemies
-- Better energy conservation (boost only when truly needed)
-- Smarter engagement: only fire while fleeing, never chase
-- Zigzag evasion pattern when under fire
-- Supply drop awareness
+Key insight from practice rules: House bots "hunt you weakest first" and
+"one early, more as you thin them out, all of them late".
+
+This means:
+- Early game: only 1-2 bots are hunting you. FIGHT THEM. Win the 1v1.
+- Each kill gives ALL their cubes + 2 bonus. Cubes = +4% HP and +4% damage.
+- Cubes make you STRONGER so you survive longer in mid/late game.
+- NPCs (12 drones, 350 HP, 2 cubes each) are free cube farms!
+
+Strategy: Aggressive early farming → kiting mid-game → tanky late-game
+
+What was wrong with v2-v4:
+- v3/v4: Too passive, ran from everything, died anyway
+- v2: Good balance but weak aiming and no NPC farming
+
+v5 improvements:
+- Farm NPC drones early (easy kills, free cubes)
+- Break crates for cubes + weapon drops
+- Engage enemies when HP advantage or 1v1
+- Better lead aiming with 2-step Newton iteration
+- Supply drop awareness (3 cubes + full heal!)
+- Regen awareness: disengage for 5s to heal when low
+- Face attackers always (rear armor protection)
 """
 import math
 import mechfight as mf
 
 UPGRADE_PRIORITY = {
-    "nanites": 100,    # Regen = survival
-    "armor": 95,       # Less damage = survival
-    "servos": 90,      # Speed = survival
-    "plating": 85,     # More HP = survival
-    "jets": 80,        # Better boost = escape
-    "reactor": 75,     # More energy = more boosts
-    "capacitor": 70,   # Energy pool
-    "sensors": 65,     # See enemies sooner = react sooner
-    "gyros": 60,       # Faster aim = faster snap shots while running
-    "gun_rate": 55,
-    "gun_damage": 50,
-    "gun_velocity": 48,
-    "gun_mag": 45,
-    "laser_damage": 40,
-    "laser_charge": 38,
-    "lightning_efficiency": 35,
-    "lightning_range": 33,
-    "mortar_splash": 20,
-    "mortar_reload": 18,
-    "mortar_velocity": 15,
-    "laser_pierce": 12,
-    "lightning_chain": 10,
+    "armor": 100,
+    "plating": 95,
+    "nanites": 90,
+    "servos": 85,
+    "gun_damage": 80,
+    "gun_rate": 78,
+    "gun_velocity": 75,
+    "jets": 72,
+    "reactor": 68,
+    "capacitor": 65,
+    "gyros": 62,
+    "sensors": 60,
+    "gun_mag": 55,
+    "laser_damage": 50,
+    "laser_charge": 48,
+    "lightning_efficiency": 45,
+    "lightning_range": 42,
+    "mortar_splash": 30,
+    "mortar_reload": 28,
+    "mortar_velocity": 25,
+    "laser_pierce": 20,
+    "lightning_chain": 18,
 }
 
 WEAPON_RANK = {"laser": 4, "lightning": 3, "mortar": 2, "gun": 1}
 
 
-def angle_diff(a, b):
+def adiff(a, b):
     return (a - b + math.pi) % (2 * math.pi) - math.pi
 
 
 class Bot:
-    name = "Ghost-v4"
+    name = "Apex-v5"
 
     def __init__(self, hello: mf.Hello):
         cfg = hello.get("config", {})
-        self.pickup_radius = cfg.get("loot", {}).get("pickup_radius", 3.5)
-        self.muzzle_height = cfg.get("mech", {}).get("muzzle_height", 7.0)
-        self.bullet_speed = cfg.get("weapons", {}).get("gun", {}).get("speed", 252.0)
+        self.pickup_r = cfg.get("loot", {}).get("pickup_radius", 4.0)
+        self.muzzle_h = cfg.get("mech", {}).get("muzzle_height", 7.0)
+        self.bullet_spd = cfg.get("weapons", {}).get("gun", {}).get("speed", 252.0)
+        self.regen_delay = cfg.get("mech", {}).get("regen_delay", 5.0)
+        self.last_combat_t = -99.0
         self.last_x = 0.0
         self.last_y = 0.0
-        self.stuck_count = 0
-        self.zigzag_phase = 1  # alternates +1 / -1
+        self.stuck = 0
 
     def act(self, obs: mf.Observation) -> mf.Action:
         me = obs["self"]
         x, y, z = me["pos"]
-        vx, vy, vz = me["vel"]
-        hp = me["hp"]
-        max_hp = me["max_hp"]
+        vx, vy, _ = me["vel"]
+        hp, max_hp = me["hp"], me["max_hp"]
         energy = me["energy"]
-        aim_yaw, aim_pitch = me["aim"]
+        aim_y, aim_p = me["aim"]
         tick = obs["tick"]
         t = obs["t"]
         grounded = me["grounded"]
-        in_zone = me["in_zone"]
+        cubes = me.get("cubes", 0)
 
         act: mf.Action = {"tick": tick}
 
-        # === 1. UPGRADE SELECTION ===
+        # --- Upgrade ---
         if obs.get("offer"):
-            choices = obs["offer"]["choices"]
-            best_i = max(range(len(choices)),
-                         key=lambda i: UPGRADE_PRIORITY.get(choices[i]["id"], 5))
-            act["pick"] = best_i
+            ch = obs["offer"]["choices"]
+            act["pick"] = max(range(len(ch)),
+                              key=lambda i: UPGRADE_PRIORITY.get(ch[i]["id"], 5))
 
-        # === 2. WEAPON PICKUP ===
+        # --- Weapon Pickup ---
         w1 = me["weapons"][1]
-        w1_kind = w1["kind"] if w1 else None
-        w1_rank = WEAPON_RANK.get(w1_kind, 0)
-
-        best_pickup = None
-        best_p_dist = 999.0
+        w1k = w1["kind"] if w1 else None
+        w1r = WEAPON_RANK.get(w1k, 0)
+        best_pu, best_pd = None, 999.0
         for p in obs.get("pickups", []):
-            rank = WEAPON_RANK.get(p["kind"], 0)
-            if rank > w1_rank:
+            r = WEAPON_RANK.get(p["kind"], 0)
+            if r > w1r:
                 d = math.dist(p["pos"][:2], (x, y))
-                if d < best_p_dist:
-                    best_p_dist = d
-                    best_pickup = p
-
-        if best_pickup and best_p_dist < self.pickup_radius:
-            act["take"] = best_pickup["id"]
+                if d < best_pd:
+                    best_pd, best_pu = d, p
+        if best_pu and best_pd < self.pickup_r:
+            act["take"] = best_pu["id"]
             if w1:
                 act["drop"] = 1
 
-        # === 3. ENEMIES ===
-        enemies = [m for m in obs.get("mechs", []) if m["kind"] == "mech"]
-        enemies.sort(key=lambda m: math.dist(m["pos"][:2], (x, y)))
-        n_visible = len(enemies)
-        nearest = enemies[0] if enemies else None
-        d_nearest = math.dist(nearest["pos"][:2], (x, y)) if nearest else 999.0
+        # --- Enemies & NPCs ---
+        mechs = [m for m in obs.get("mechs", []) if m["kind"] == "mech"]
+        npcs = [m for m in obs.get("mechs", []) if m["kind"] == "npc"]
+        mechs.sort(key=lambda m: math.dist(m["pos"][:2], (x, y)))
+        npcs.sort(key=lambda m: math.dist(m["pos"][:2], (x, y)))
 
-        # Threat level: how many enemies are close
-        close_enemies = sum(1 for e in enemies if math.dist(e["pos"][:2], (x, y)) < 80.0)
-        danger = close_enemies >= 2 or d_nearest < 30.0
+        nearest_e = mechs[0] if mechs else None
+        d_ne = math.dist(nearest_e["pos"][:2], (x, y)) if nearest_e else 999.0
+        nearest_npc = npcs[0] if npcs else None
+        d_npc = math.dist(nearest_npc["pos"][:2], (x, y)) if nearest_npc else 999.0
+        close_mechs = sum(1 for m in mechs if math.dist(m["pos"][:2], (x, y)) < 70)
 
-        # === 4. ZONE ===
+        # Combat timestamp tracking
+        for ev in obs.get("events", []):
+            if ev.get("type") in ("damaged", "hit"):
+                self.last_combat_t = t
+
+        # --- Zone ---
         zone = obs["zone"]
-        zc = zone["center"]
-        zr = zone["radius"]
-        nc = zone["next_center"]
-        nr = zone["next_radius"]
-        shrink_start = zone.get("shrink_start", 999)
-        dps = zone.get("dps", 20)
+        zc, zr = zone["center"], zone["radius"]
+        nc, nr = zone["next_center"], zone["next_radius"]
+        dc = math.dist((x, y), zc)
+        dn = math.dist((x, y), nc)
+        to_nc = ((nc[0] - x) / max(0.01, dn), (nc[1] - y) / max(0.01, dn))
 
-        d_center = math.dist((x, y), zc)
-        d_next = math.dist((x, y), nc)
+        # --- Choose Primary Target ---
+        # Priority: NPC if close (easy cubes), else nearest mech
+        target = None
+        d_target = 999.0
 
-        to_nc_x = (nc[0] - x) / max(0.01, d_next)
-        to_nc_y = (nc[1] - y) / max(0.01, d_next)
+        if nearest_npc and d_npc < 55.0 and (d_ne > 50.0 or close_mechs <= 1):
+            # Farm NPC when safe
+            target = nearest_npc
+            d_target = d_npc
+        elif nearest_e:
+            target = nearest_e
+            d_target = d_ne
 
-        # === 5. MOVEMENT STRATEGY ===
+        # --- Crate targeting when no enemies ---
+        crate_target = None
+        if obs.get("crates") and d_ne > 55.0:
+            crs = sorted(obs["crates"], key=lambda c: math.dist(c["pos"][:2], (x, y)))
+            cr = crs[0]
+            cd = math.dist(cr["pos"][:2], (x, y))
+            if cd < 50.0:
+                crate_target = cr
+
+        # --- Aiming & Firing ---
+        des_yaw, des_pitch = aim_y, 0.0
+        fire0, fire1 = False, False
+
+        if target:
+            ep = target["pos"]
+            ev = target.get("vel", [0, 0, 0])
+            is_npc = target.get("kind") == "npc"
+            tz_offset = 1.5 if is_npc else 4.5
+            tx, ty, tz = ep[0], ep[1], ep[2] + tz_offset
+
+            # 2-step Newton lead aiming
+            d3 = math.dist((x, y, z + self.muzzle_h), (tx, ty, tz))
+            tf = d3 / self.bullet_spd
+            px, py, pz = tx + ev[0] * tf, ty + ev[1] * tf, tz + ev[2] * tf
+            d3r = math.dist((x, y, z + self.muzzle_h), (px, py, pz))
+            tf2 = d3r / self.bullet_spd
+            fx, fy, fz = tx + ev[0] * tf2, ty + ev[1] * tf2, tz + ev[2] * tf2
+
+            ddx, ddy = fx - x, fy - y
+            ddz = fz - (z + self.muzzle_h)
+            hd = math.hypot(ddx, ddy)
+            des_yaw = math.atan2(ddy, ddx)
+            des_pitch = math.atan2(ddz, max(1.0, hd))
+
+            ye = abs(adiff(des_yaw, aim_y))
+            pe = abs(des_pitch - aim_p)
+
+            w0 = me["weapons"][0]
+            if w0 and w0["reload"] == 0 and ye < 0.20 and pe < 0.25:
+                fire0 = True
+
+            if w1:
+                k = w1["kind"]
+                if k == "lightning" and d_target < 42 and ye < 0.45:
+                    fire1 = True
+                elif k == "laser" and ye < 0.28:
+                    ch = w1.get("charge", 0.0)
+                    fire1 = ch < 0.65
+                elif k == "mortar" and 40 < d_target < 190 and ye < 0.25:
+                    fire1 = True
+
+        elif crate_target:
+            cp = crate_target["pos"]
+            cdx, cdy = cp[0] - x, cp[1] - y
+            cdz = cp[2] + 1.0 - (z + self.muzzle_h)
+            ch = math.hypot(cdx, cdy)
+            des_yaw = math.atan2(cdy, cdx)
+            des_pitch = math.atan2(cdz, max(1.0, ch))
+            if abs(adiff(des_yaw, aim_y)) < 0.18:
+                fire0 = True
+
+        # Pre-reload
+        w0 = me["weapons"][0]
+        if w0 and w0["reload"] == 0 and w0["ammo"] <= 3 and d_ne > 45:
+            act["reload"] = True
+
+        act["aim"] = [des_yaw, des_pitch]
+        act["fire"] = [fire0, fire1]
+
+        # --- Movement ---
         mx, my = 0.0, 0.0
         boost = False
+        jump = False
 
-        # Priority 1: Stay in zone
-        outside_zone = d_center > (zr - 12.0)
-        zone_shrinking = t >= shrink_start
-        need_zone = outside_zone or (zone_shrinking and d_next > (nr - 15.0))
+        outside = dc > (zr - 12) or (not me["in_zone"])
+        need_zone = outside or (dn > (nr - 15) and t >= zone.get("shrink_start", 999))
 
-        if not in_zone or need_zone:
-            # URGENT: get to safety
-            mx, my = to_nc_x, to_nc_y
-            boost = energy > 15
-        elif danger:
-            # Priority 2: RUN from enemies
-            # Flee direction: away from centroid of close enemies
-            flee_x, flee_y = 0.0, 0.0
-            for e in enemies:
-                ed = math.dist(e["pos"][:2], (x, y))
-                if ed < 80.0:
-                    w = 1.0 / max(1.0, ed)
-                    flee_x += (x - e["pos"][0]) * w
-                    flee_y += (y - e["pos"][1]) * w
+        # HP fraction
+        hp_frac = hp / max(1, max_hp)
 
-            fl = math.hypot(flee_x, flee_y)
+        # Regen check: if low HP and can disengage, run to heal
+        can_regen = (t - self.last_combat_t) > self.regen_delay
+        want_disengage = hp_frac < 0.35 and d_ne > 30
+
+        if need_zone:
+            mx, my = to_nc
+            boost = not me["in_zone"] or energy > 20
+
+        elif want_disengage and not can_regen:
+            # Run away to heal
+            if nearest_e:
+                fx = (x - nearest_e["pos"][0]) / max(0.01, d_ne)
+                fy = (y - nearest_e["pos"][1]) / max(0.01, d_ne)
+                zone_pull = 0.3 if dn < (nr - 20) else 0.5
+                mx = fx * (1 - zone_pull) + to_nc[0] * zone_pull
+                my = fy * (1 - zone_pull) + to_nc[1] * zone_pull
+                boost = d_ne < 35 and energy > 20
+            else:
+                mx, my = to_nc
+
+        elif close_mechs >= 3 or (close_mechs >= 2 and hp_frac < 0.5):
+            # Too many enemies: flee from centroid
+            fx, fy = 0.0, 0.0
+            for m in mechs:
+                md = math.dist(m["pos"][:2], (x, y))
+                if md < 70:
+                    w = 1.0 / max(1.0, md)
+                    fx += (x - m["pos"][0]) * w
+                    fy += (y - m["pos"][1]) * w
+            fl = math.hypot(fx, fy)
             if fl > 0.01:
-                flee_x /= fl
-                flee_y /= fl
+                fx, fy = fx / fl, fy / fl
+            zone_pull = 0.15 if dn < (nr - 25) else 0.4
+            mx = fx * (1 - zone_pull) + to_nc[0] * zone_pull
+            my = fy * (1 - zone_pull) + to_nc[1] * zone_pull
+            boost = d_ne < 35 and energy > 25
 
-            # Zigzag while fleeing (harder to hit)
-            if tick % 15 == 0:
-                self.zigzag_phase *= -1
-            perp_x = -flee_y * self.zigzag_phase * 0.4
-            perp_y = flee_x * self.zigzag_phase * 0.4
+        elif target and d_target < 55:
+            # KITING: maintain 30-45m distance from target while fighting
+            ideal_dist = 38.0
+            tp = target["pos"]
+            flee_x = (x - tp[0]) / max(0.01, d_target)
+            flee_y = (y - tp[1]) / max(0.01, d_target)
 
-            # Blend: flee + zigzag + pull toward zone center
-            zone_pull = 0.15 if d_next < (nr - 25.0) else 0.4
-            mx = flee_x * 0.75 + perp_x + to_nc_x * zone_pull
-            my = flee_y * 0.75 + perp_y + to_nc_y * zone_pull
+            if d_target < ideal_dist - 5:
+                # Too close: back up
+                mx = flee_x * 0.85 + to_nc[0] * 0.15
+                my = flee_y * 0.85 + to_nc[1] * 0.15
+                boost = d_target < 20 and energy > 25
+            elif d_target > ideal_dist + 10:
+                # Too far: close in (only if 1v1)
+                mx = -flee_x * 0.6 + to_nc[0] * 0.4
+                my = -flee_y * 0.6 + to_nc[1] * 0.4
+            else:
+                # Good range: strafe
+                strafe_x = -flee_y
+                strafe_y = flee_x
+                mx = strafe_x * 0.75 + to_nc[0] * 0.25
+                my = strafe_y * 0.75 + to_nc[1] * 0.25
 
-            boost = d_nearest < 35.0 and energy > 25
+        elif crate_target:
+            # Move toward crate
+            cp = crate_target["pos"]
+            cd = math.dist(cp[:2], (x, y))
+            mx = (cp[0] - x) / max(0.01, cd)
+            my = (cp[1] - y) / max(0.01, cd)
+
         else:
-            # Priority 3: Patrol ring & loot
-            target_r = max(12.0, nr * 0.6)
-            r_err = target_r - d_next
-
-            # Tangent for circling
-            tan_x = -to_nc_y
-            tan_y = to_nc_x
-            # Radial correction
-            rad_x = -to_nc_x * (r_err / max(1.0, target_r))
-            rad_y = -to_nc_y * (r_err / max(1.0, target_r))
-
+            # Patrol ring at 60% of zone radius
+            tr = max(12, nr * 0.6)
+            rerr = tr - dn
+            tan_x, tan_y = -to_nc[1], to_nc[0]
+            rad_x = -to_nc[0] * (rerr / max(1, tr))
+            rad_y = -to_nc[1] * (rerr / max(1, tr))
             mx = tan_x * 0.7 + rad_x * 0.5
             my = tan_y * 0.7 + rad_y * 0.5
 
-            # Steer toward cubes when safe
-            if obs.get("cubes") and d_nearest > 50.0:
-                cubes_sorted = sorted(obs["cubes"],
-                                      key=lambda c: math.dist(c["pos"][:2], (x, y)))
-                cp = cubes_sorted[0]["pos"]
-                dc = math.dist(cp[:2], (x, y))
-                if dc < 22.0:
-                    mx = mx * 0.3 + (cp[0] - x) / max(0.01, dc) * 0.7
-                    my = my * 0.3 + (cp[1] - y) / max(0.01, dc) * 0.7
+        # Cube/pickup attraction when patrolling
+        if not need_zone and d_ne > 45:
+            if obs.get("cubes"):
+                cs = sorted(obs["cubes"], key=lambda c: math.dist(c["pos"][:2], (x, y)))
+                cp = cs[0]["pos"]
+                cd = math.dist(cp[:2], (x, y))
+                if cd < 20:
+                    mx = mx * 0.3 + (cp[0] - x) / max(0.01, cd) * 0.7
+                    my = my * 0.3 + (cp[1] - y) / max(0.01, cd) * 0.7
 
-            # Steer toward weapon pickups
-            if best_pickup and d_nearest > 45.0 and best_p_dist < 28.0:
-                px = (best_pickup["pos"][0] - x) / max(0.01, best_p_dist)
-                py = (best_pickup["pos"][1] - y) / max(0.01, best_p_dist)
-                mx = mx * 0.25 + px * 0.75
-                my = my * 0.25 + py * 0.75
+            if best_pu and best_pd < 25:
+                px = (best_pu["pos"][0] - x) / max(0.01, best_pd)
+                py = (best_pu["pos"][1] - y) / max(0.01, best_pd)
+                mx = mx * 0.3 + px * 0.7
+                my = my * 0.3 + py * 0.7
 
-        # === 6. PROJECTILE EVASION ===
+        # Supply drop attraction
+        for drop in obs.get("drops", []):
+            dp = drop["pos"]
+            dd = math.dist(dp[:2], (x, y))
+            lands_in = drop.get("lands_in", 99)
+            holder = drop.get("holder")
+            if lands_in <= 0 and holder is None and dd < 40 and d_ne > 50:
+                mx = (dp[0] - x) / max(0.01, dd)
+                my = (dp[1] - y) / max(0.01, dd)
+                boost = dd > 15 and energy > 20
+
+        # Projectile evasion
         for proj in obs.get("projectiles", []):
-            pp = proj["pos"]
-            pv = proj["vel"]
+            pp, pv = proj["pos"], proj["vel"]
             pd = math.dist(pp[:2], (x, y))
-            if pd < 30.0:
+            if pd < 30:
                 rx, ry = x - pp[0], y - pp[1]
-                if rx * pv[0] + ry * pv[1] > 0:  # heading toward us
+                if rx * pv[0] + ry * pv[1] > 0:
                     vm = math.hypot(pv[0], pv[1])
-                    if vm > 1.0:
-                        mx += (-pv[1] / vm) * 1.5
-                        my += (pv[0] / vm) * 1.5
-                        if pd < 15.0:
+                    if vm > 1:
+                        mx += (-pv[1] / vm) * 1.3
+                        my += (pv[0] / vm) * 1.3
+                        if pd < 15:
                             boost = energy > 15
 
-        # === 7. STUCK DETECTION ===
-        moved = math.hypot(x - self.last_x, y - self.last_y)
-        speed = math.hypot(vx, vy)
-        if speed < 1.5 and math.hypot(mx, my) > 0.3 and grounded:
-            self.stuck_count += 1
+        # Stuck detection
+        spd = math.hypot(vx, vy)
+        if spd < 1.5 and math.hypot(mx, my) > 0.3 and grounded:
+            self.stuck += 1
         else:
-            self.stuck_count = 0
+            self.stuck = 0
         self.last_x, self.last_y = x, y
 
-        jump = False
-        if self.stuck_count > 4:
-            # Perpendicular escape
+        if self.stuck > 4:
             ml = math.hypot(mx, my)
             if ml > 0.01:
                 mx, my = -my / ml, mx / ml
             jump = grounded
             boost = energy > 15
-            self.stuck_count = 0
+            self.stuck = 0
 
         # Normalize
         ml = math.hypot(mx, my)
-        if ml > 1.0:
+        if ml > 1:
             mx /= ml
             my /= ml
 
         act["move"] = [mx, my]
         act["boost"] = boost
-        act["jump"] = jump or (tick % 80 == 0 and grounded and not boost and not danger)
+        act["jump"] = jump or (tick % 90 == 0 and grounded and not boost)
 
-        # === 8. AIMING & FIRING ===
-        desired_yaw = aim_yaw
-        desired_pitch = 0.0
-        fire0 = False
-        fire1 = False
-
-        if nearest:
-            ep = nearest["pos"]
-            ev = nearest["vel"]
-            tx, ty, tz = ep[0], ep[1], ep[2] + 4.5
-
-            # Lead aiming
-            d3 = math.dist((x, y, z + self.muzzle_height), (tx, ty, tz))
-            tf = d3 / self.bullet_speed
-            px = tx + ev[0] * tf
-            py = ty + ev[1] * tf
-            pz = tz + ev[2] * tf
-
-            d3r = math.dist((x, y, z + self.muzzle_height), (px, py, pz))
-            tf2 = d3r / self.bullet_speed
-            fx = tx + ev[0] * tf2
-            fy = ty + ev[1] * tf2
-            fz = tz + ev[2] * tf2
-
-            ddx = fx - x
-            ddy = fy - y
-            ddz = fz - (z + self.muzzle_height)
-            hd = math.hypot(ddx, ddy)
-
-            desired_yaw = math.atan2(ddy, ddx)
-            desired_pitch = math.atan2(ddz, max(1.0, hd))
-
-            ye = abs(angle_diff(desired_yaw, aim_yaw))
-            pe = abs(desired_pitch - aim_pitch)
-
-            # Fire gun while running (snap shots)
-            w0 = me["weapons"][0]
-            if w0 and w0["reload"] == 0 and ye < 0.18 and pe < 0.22 and d_nearest < 180.0:
-                fire0 = True
-
-            # Slot 1
-            if w1:
-                k = w1["kind"]
-                if k == "lightning" and d_nearest < 42.0 and ye < 0.45:
-                    fire1 = True
-                elif k == "laser" and d_nearest > 30.0 and ye < 0.28:
-                    ch = w1.get("charge", 0.0)
-                    fire1 = ch < 0.65  # hold to charge, release at 0.65+
-                elif k == "mortar" and 45.0 < d_nearest < 190.0 and ye < 0.25:
-                    fire1 = True
-        elif obs.get("crates"):
-            # Shoot crate if safe
-            crs = sorted(obs["crates"], key=lambda c: math.dist(c["pos"][:2], (x, y)))
-            cr = crs[0]
-            cxyz = cr["pos"]
-            cdx = cxyz[0] - x
-            cdy = cxyz[1] - y
-            cdz = cxyz[2] + 1.0 - (z + self.muzzle_height)
-            ch = math.hypot(cdx, cdy)
-            desired_yaw = math.atan2(cdy, cdx)
-            desired_pitch = math.atan2(cdz, max(1.0, ch))
-            if abs(angle_diff(desired_yaw, aim_yaw)) < 0.18 and ch < 60.0:
-                fire0 = True
-
-        # Pre-reload when safe
-        w0 = me["weapons"][0]
-        if w0 and w0["reload"] == 0 and w0["ammo"] <= 3 and d_nearest > 50.0:
-            act["reload"] = True
-
-        act["aim"] = [desired_yaw, desired_pitch]
-        act["fire"] = [fire0, fire1]
-
-        mf.draw.label(f"Ghost-v4 HP:{hp:.0f} E:{energy:.0f} vis:{n_visible}")
-
+        mf.draw.label(f"v5 HP:{hp:.0f} C:{cubes} E:{energy:.0f} vis:{len(mechs)}")
         return act
 
 
