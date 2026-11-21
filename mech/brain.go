@@ -659,7 +659,9 @@ func (b *Brain) step(o *Obs, act *Action) {
 		if losing {
 			b.loseAt = now
 		}
-		b.retreat = now-b.loseAt < 1.5 && b.loseAt > 0
+		if now-b.loseAt < 2.0 && b.loseAt > 0 {
+			b.retreat = true
+		}
 	}
 
 	exposed := false
@@ -1974,6 +1976,9 @@ func squadParams(p Params) Params {
 	p.LowBonus = 200
 	p.LethalK = 0.6
 	p.Backstab = 40
+	p.RetreatHP = 0.44
+	p.RecoverHP = 0.80
+	p.FightLoot = 75
 
 	return p
 }
