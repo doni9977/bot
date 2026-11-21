@@ -1972,7 +1972,6 @@ func squadParams(p Params) Params {
 	p.LowBonus = 200
 	p.LethalK = 0.7
 	p.HPw = 0.18
-	p.LaserRange = 110
 
 	return p
 }
