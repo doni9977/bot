@@ -332,7 +332,7 @@ func (b *Brain) observe(o *Obs) {
 	if b.otherDead >= 5 {
 		b.notPractice = true
 	}
-	if on := b.base.Practice && !b.notPractice && now > 20; on != b.pracOn {
+	if on := b.base.Practice && !b.notPractice; on != b.pracOn {
 		b.pracOn = on
 		b.P = b.base
 		if on {
@@ -1021,13 +1021,10 @@ func (b *Brain) step(o *Obs, act *Action) {
 						break
 					}
 				}
+				aim = [2]float64{hy, hp}
 				if w.Charge < full-0.051 {
 					act.Fire[i] = true
-					if w.Charge > full*0.45 {
-						aim = [2]float64{hy, hp}
-					}
 				} else {
-					aim = [2]float64{hy, hp}
 					ey := math.Abs(angDiff(hy, me.Aim[0]))
 					ep := math.Abs(hp - me.Aim[1])
 					if ey < tolY*0.9 && ep < tolP {
@@ -1971,6 +1968,8 @@ func squadParams(p Params) Params {
 	p.LaserUp = true
 	p.Lethal = true
 	p.Finish = 20
+	p.FinishRush = true
+	p.Pursue = 0.35
 	p.Stick = 200
 	p.HPw = 0.1
 	p.LowBonus = 200
