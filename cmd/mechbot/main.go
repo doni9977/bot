@@ -1,4 +1,4 @@
-// Command mechbot implements Apex-Go for Mech Royale (mechfight/1 over stdin/stdout).
+// Command mechbot is the apex-go mechfight/1 bot: JSON lines on stdin, one action per observation on stdout.
 package main
 
 import (
@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"runtime/debug"
+	"strconv"
 
 	"apexbot/internal/bot"
 	"apexbot/internal/proto"
@@ -19,46 +20,20 @@ type agent interface {
 	Act(o *proto.Obs) proto.Action
 }
 
-type blind struct{}
-
-func (blind) Act(o *proto.Obs) proto.Action {
-	a := proto.NewAction(o.Tick)
-	me := o.Self
-	gx, gy := o.Zone.NextCenter[0], o.Zone.NextCenter[1]
-	yaw := math.Atan2(gy-me.Pos[1], gx-me.Pos[0])
-	if math.Hypot(gx-me.Pos[0], gy-me.Pos[1]) > 10 {
-		a.Move = [2]float64{math.Cos(yaw), math.Sin(yaw)}
+// newAgent builds the real bot for a hello; returns nil when the arena cannot be loaded.
+// It may panic: the caller recovers and falls back to blind.
+func newAgent(h *proto.Hello) (agent, string) {
+	w := loadWorld(h.Map.Dir, "/arena", "arena")
+	if w == nil {
+		return nil, "doni"
 	}
-	a.Aim = [2]float64{yaw, 0}
-	a.HasAim = true
-	a.Boost = !me.InZone
-	best := -1.0
-	for i := range o.Mechs {
-		m := &o.Mechs[i]
-		if m.Kind != "mech" {
-			continue
-		}
-		d := math.Hypot(m.Pos[0]-me.Pos[0], m.Pos[1]-me.Pos[1])
-		if best < 0 || d < best {
-			best = d
-			tf := d / 252
-			a.Aim = [2]float64{
-				math.Atan2(m.Pos[1]+m.Vel[1]*tf-me.Pos[1], m.Pos[0]+m.Vel[0]*tf-me.Pos[0]),
-				math.Atan2(m.Pos[2]+4.5-me.Pos[2]-7, math.Max(d, 1)),
-			}
-			a.Fire = [2]bool{true, true}
-		}
-	}
-	if o.Offer != nil {
-		a.Pick = 0
-	}
-	return a
+	nav := world.NewNav(w, proto.Stat(h.Config.Mech, "step_up", 1.2), proto.Stat(h.Config.Mech, "height", 9))
+	p := bot.DefaultParams()
+	b := bot.New(h, w, nav, p)
+	return b, b.P.Name
 }
 
-func logf(format string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, format+"\n", args...)
-}
-
+// loadWorld: first directory that loads; "" is skipped.
 func loadWorld(dirs ...string) *world.World {
 	for _, d := range dirs {
 		if d == "" {
@@ -68,29 +43,13 @@ func loadWorld(dirs ...string) *world.World {
 		if err == nil {
 			return w
 		}
-		logf("world load from %q failed: %v", d, err)
 	}
 	return nil
-}
-
-func safeAct(ag agent, o *proto.Obs, last *proto.Action) (act proto.Action) {
-	defer func() {
-		if r := recover(); r != nil {
-			logf("panic at tick %d: %v\n%s", o.Tick, r, debug.Stack())
-			act = proto.NewAction(o.Tick)
-			act.Move = last.Move
-			act.Boost = last.Boost
-			act.Aim = last.Aim
-			act.HasAim = last.HasAim
-		}
-	}()
-	return ag.Act(o)
 }
 
 func main() {
 	debug.SetGCPercent(800)
 	debug.SetMemoryLimit(380 << 20)
-
 	lines := make(chan []byte, 256)
 	go func() {
 		rd := bufio.NewReaderSize(os.Stdin, 1<<20)
@@ -105,7 +64,6 @@ func main() {
 			}
 		}
 	}()
-
 	out := bufio.NewWriterSize(os.Stdout, 1<<16)
 	var ag agent
 	var last proto.Action
@@ -113,11 +71,11 @@ func main() {
 	badObs := 0
 
 	handle := func(line []byte) (obsLine []byte, done bool) {
-		var head struct {
-			Type string `json:"type"`
-		}
 		if bytes.Contains(line[:min(len(line), 40)], []byte(`"obs"`)) {
 			return line, false
+		}
+		var head struct {
+			Type string `json:"type"`
 		}
 		if err := json.Unmarshal(line, &head); err != nil {
 			return nil, false
@@ -130,37 +88,30 @@ func main() {
 		case "hello":
 			var h proto.Hello
 			if err := json.Unmarshal(line, &h); err != nil {
-				logf("bad hello: %v (retrying sanitised)", err)
 				h = proto.Hello{}
-				if err2 := json.Unmarshal(stripZeroFractions(line), &h); err2 != nil {
-					logf("bad hello again: %v", err2)
-				}
+				json.Unmarshal(stripZeroFractions(line), &h)
 			}
 			name := "doni"
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
-						logf("init panic: %v\n%s", r, debug.Stack())
+						fmt.Fprintf(os.Stderr, "init panic: %v\n", r)
 						ag = blind{}
 					}
 				}()
-				w := loadWorld(h.Map.Dir, "/arena", "arena")
-				if w == nil {
+				a, n := newAgent(&h)
+				if a == nil {
 					ag = blind{}
 					return
 				}
-				nav := world.NewNav(w, stat(h.Config.Mech, "step_up", 1.2), stat(h.Config.Mech, "height", 9))
-				p := bot.DefaultParams()
-				if raw := os.Getenv("BOT_PARAMS"); raw != "" {
-					if err := json.Unmarshal([]byte(raw), &p); err != nil {
-						logf("bad BOT_PARAMS: %v", err)
-					}
-				}
-				b := bot.New(&h, w, nav, p)
-				name = b.P.Name
-				ag = b
+				name = n
+				ag = a
 			}()
-			fmt.Fprintf(out, "{\"type\":\"ready\",\"name\":%q}\n", name)
+			buf = buf[:0]
+			buf = append(buf, `{"type":"ready","name":`...)
+			buf = strconv.AppendQuote(buf, name)
+			buf = append(buf, "}\n"...)
+			out.Write(buf)
 			out.Flush()
 		}
 		return nil, false
@@ -198,7 +149,7 @@ func main() {
 			if err2 := json.Unmarshal(stripZeroFractions(latest), &o); err2 != nil {
 				badObs++
 				if badObs <= 5 || badObs%200 == 0 {
-					logf("bad obs (%d so far): %v", badObs, err)
+					fmt.Fprintf(os.Stderr, "bad obs (%d): %v\n", badObs, err2)
 				}
 				if tick, ok := sniffTick(latest); ok {
 					act := proto.NewAction(tick)
@@ -226,6 +177,22 @@ func main() {
 	}
 }
 
+// safeAct: on a panic in Act, emit the previous move/boost/aim without fire nor label.
+func safeAct(ag agent, o *proto.Obs, last *proto.Action) (act proto.Action) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "act panic: %v\n", r)
+			act = proto.NewAction(o.Tick)
+			act.Move = last.Move
+			act.Boost = last.Boost
+			act.Aim = last.Aim
+			act.HasAim = last.HasAim
+		}
+	}()
+	return ag.Act(o)
+}
+
+// stripZeroFractions removes zero fractions outside strings: "3.0" -> "3", "12.000," -> "12,".
 func stripZeroFractions(in []byte) []byte {
 	out := make([]byte, 0, len(in))
 	inStr, esc := false, false
@@ -262,6 +229,7 @@ func stripZeroFractions(in []byte) []byte {
 	return out
 }
 
+// sniffTick reads the integer after the first `"tick":` (leading spaces skipped).
 func sniffTick(line []byte) (int, bool) {
 	k := bytes.Index(line, []byte(`"tick":`))
 	if k < 0 {
@@ -282,9 +250,39 @@ func sniffTick(line []byte) (int, bool) {
 	return n, seen
 }
 
-func stat(m map[string]float64, key string, def float64) float64 {
-	if v, ok := m[key]; ok {
-		return v
+// blind is the fallback agent (no arena, or a panic during init).
+type blind struct{}
+
+func (blind) Act(o *proto.Obs) proto.Action {
+	a := proto.NewAction(o.Tick)
+	me := o.Self
+	gx, gy := o.Zone.NextCenter[0], o.Zone.NextCenter[1]
+	yaw := math.Atan2(gy-me.Pos[1], gx-me.Pos[0])
+	if math.Hypot(gx-me.Pos[0], gy-me.Pos[1]) > 10 {
+		a.Move = [2]float64{math.Cos(yaw), math.Sin(yaw)}
 	}
-	return def
+	a.Aim = [2]float64{yaw, 0}
+	a.HasAim = true
+	a.Boost = !me.InZone
+	best := -1.0
+	for i := range o.Mechs {
+		m := &o.Mechs[i]
+		if m.Kind != "mech" {
+			continue
+		}
+		d := math.Hypot(m.Pos[0]-me.Pos[0], m.Pos[1]-me.Pos[1])
+		if best < 0 || d < best {
+			best = d
+			tf := d / 252
+			a.Aim = [2]float64{
+				math.Atan2(m.Pos[1]+m.Vel[1]*tf-me.Pos[1], m.Pos[0]+m.Vel[0]*tf-me.Pos[0]),
+				math.Atan2(m.Pos[2]+4.5-me.Pos[2]-7, math.Max(d, 1)),
+			}
+			a.Fire = [2]bool{true, true}
+		}
+	}
+	if o.Offer != nil {
+		a.Pick = 0
+	}
+	return a
 }

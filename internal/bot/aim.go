@@ -1,39 +1,27 @@
 package bot
 
-import (
-	"math"
+import "math"
 
-	"apexbot/internal/proto"
-)
-
-// shot is an aiming solution.
 type shot struct {
 	ok         bool
 	yaw, pitch float64
-	tf         float64    // projectile flight time
-	point      [3]float64 // where we expect to hit
+	tf         float64
+	point      [3]float64
 	dist       float64
-	clear      bool // nothing solid between the muzzle and the hit point
+	clear      bool
 }
 
-const fireLatency = 0.075 // our action lands 1-2 ticks after the observation
+const fireLatency = 0.075
 
-// aimTarget describes something to shoot at.
 type aimTarget struct {
-	pos, vel [3]float64
-	radius   float64
-	centerZ  float64 // height of the aim point above pos
-	mech     bool
-	// lead multiplier (0..1) for projectile solutions; only meaningful when leadSet
-	lead    float64
-	leadSet bool
-	// the multiplier to use for the gun (engage copies it into lead for the gun's solution only:
-	// the laser is instant and keeps the plain latency lead)
-	gunLead    float64
-	gunLeadSet bool
-	// Apex-Go v2: target vulnerability multipliers from hello.config
-	rear       bool // enemy back is facing us (mech.rear_mult)
-	hasMortar  bool // enemy carries a mortar (weapons.laser.cookoff)
+	pos, vel        [3]float64
+	radius, centerZ float64
+	mech            bool
+	lead            float64
+	leadSet         bool
+	gunLead         float64
+	gunLeadSet      bool
+	rear, hasMortar bool
 }
 
 func (b *Bot) isRear(tr *Track) bool {
@@ -45,18 +33,30 @@ func (b *Bot) isRear(tr *Track) bool {
 	return math.Abs(angDiff(tr.Aim[0], bear)) > halfFront
 }
 
+func (b *Bot) gunLead(tr *Track) float64 {
+	if tr.NPC {
+		return 1
+	}
+	// from ahmad-ovh/Buildathon@56e0f76b (MIT): per-opponent learned lead
+	if b.P.LeadCum && tr.leadN >= b.P.LeadCumMin {
+		margin := 0.2 * tr.leadN
+		if tr.missNone < tr.missLead-margin {
+			return 0
+		}
+		if tr.missLead < tr.missNone-margin {
+			return 1
+		}
+	}
+	return b.leadPersistAt(tr, b.t)
+}
+
 func (b *Bot) targetOf(tr *Track) aimTarget {
 	if tr.NPC {
 		return aimTarget{pos: tr.Pos, vel: tr.Vel, radius: stat(b.C.Npc, "radius", 1.8), centerZ: stat(b.C.Npc, "height", 3.5) * 0.5}
 	}
 	sc := tr.scale(b.sizePerCube)
-	at := aimTarget{
-		pos: tr.Pos, vel: tr.Vel, radius: b.mech("radius", 2.5) * sc, centerZ: 4.5 * sc, mech: true,
-		rear: b.isRear(tr), hasMortar: tr.Mortar,
-	}
-	if b.P.LeadPersist || b.P.LeadCum {
-		at.gunLead, at.gunLeadSet = b.gunLead(tr), true
-	}
+	at := aimTarget{pos: tr.Pos, vel: tr.Vel, radius: b.mech("radius", 2.5) * sc, centerZ: 4.5 * sc, mech: true, rear: b.isRear(tr), hasMortar: tr.Mortar}
+	at.gunLead, at.gunLeadSet = b.gunLead(tr), true
 	return at
 }
 
@@ -69,12 +69,6 @@ func (b *Bot) leadDamp(tf float64) float64 {
 		d = b.P.LeadDamp
 	}
 	return d
-}
-
-// solveDirect computes the aim to hit a target with a straight projectile of the given speed
-// (speed <= 0 means hitscan) leaving from originH above our feet.
-func (b *Bot) solveDirect(tg aimTarget, speed, originH float64) shot {
-	return b.solveDirectLat(tg, speed, originH, fireLatency)
 }
 
 func (b *Bot) solveDirectLat(tg aimTarget, speed, originH, lat float64) shot {
@@ -90,6 +84,7 @@ func (b *Bot) solveDirectLat(tg aimTarget, speed, originH, lat float64) shot {
 	if tg.leadSet {
 		k = tg.lead
 	}
+	// from ahmad-ovh/Buildathon@56e0f76b (MIT): 4-pass ballistic solve with vertical lead
 	for it := 0; it < 4; it++ {
 		damp := b.leadDamp(tf)
 		px = tg.pos[0] + tg.vel[0]*(lat+tf*damp)*k
@@ -107,7 +102,6 @@ func (b *Bot) solveDirectLat(tg aimTarget, speed, originH, lat float64) shot {
 	s.yaw = math.Atan2(py-oy, px-ox)
 	s.pitch = math.Atan2(pz-oz, hd)
 	s.dist = math.Sqrt(hd*hd + (pz-oz)*(pz-oz))
-	// path check from the muzzle to just short of the target surface
 	if s.dist > 1e-3 {
 		dx, dy, dz := (px-ox)/s.dist, (py-oy)/s.dist, (pz-oz)/s.dist
 		reach := s.dist - tg.radius*0.9
@@ -122,7 +116,6 @@ func (b *Bot) solveDirectLat(tg aimTarget, speed, originH, lat float64) shot {
 	return s
 }
 
-// solveMortar computes a ballistic solution (low arc first, high arc when the low one is blocked).
 func (b *Bot) solveMortar(tg aimTarget, st map[string]float64) shot {
 	v := stat(st, "speed", 72)
 	g := stat(st, "gravity", 22)
@@ -175,7 +168,6 @@ func (b *Bot) solveMortar(tg aimTarget, st map[string]float64) shot {
 		s := shot{ok: true, tf: tf, point: [3]float64{px, py, pz}, pitch: th}
 		s.yaw = math.Atan2(py-oy, px-ox)
 		s.dist = hyp(px-ox, py-oy)
-		// sample the arc for walls
 		s.clear = true
 		cy, sy := math.Cos(s.yaw), math.Sin(s.yaw)
 		vh, vz := v*math.Cos(th), v*math.Sin(th)
@@ -188,7 +180,6 @@ func (b *Bot) solveMortar(tg aimTarget, st map[string]float64) shot {
 			}
 			nx, ny, nz := ox+cy*vh*tt, oy+sy*vh*tt, oz+vz*tt-0.5*g*tt*tt
 			if !b.W.Visible(lx, ly, lz, nx, ny, nz) {
-				// allowed only at the very end (the ground at the target)
 				if hyp(nx-px, ny-py) > 3.5 {
 					s.clear = false
 				}
@@ -203,7 +194,6 @@ func (b *Bot) solveMortar(tg aimTarget, st map[string]float64) shot {
 	return shot{}
 }
 
-// aimErr returns how far our actual torso is from a solution, after the slew we get before firing.
 func (b *Bot) aimErr(s shot) (float64, float64) {
 	ey := math.Abs(angDiff(s.yaw, b.aim[0])) - b.turn*b.dt*0.9
 	ep := math.Abs(s.pitch-b.aim[1]) - b.pitchR*b.dt*0.9
@@ -226,17 +216,14 @@ func (b *Bot) laserDamageAt(st map[string]float64, charge float64) float64 {
 	return stat(st, "damage", 315) * (mf + (1-mf)*f) * b.cubeDamageMul(b.o.Self.Cubes)
 }
 
-// engage aims at tg and works the triggers. suppress=false means we may fire.
-// It returns true when something was fired or is charging (for bookkeeping).
-func (b *Bot) engage(act *proto.Action, tg aimTarget, hasLOS, losRecent bool, hpLeft float64, allowFire bool) {
+func (b *Bot) engage(act *Action, tg aimTarget, hasLOS, losRecent bool, hpLeft float64, allowFire bool) {
 	gunI, lasI, ligI, morI := b.has("gun"), b.has("laser"), b.has("lightning"), b.has("mortar")
 	var gunS, lasS, morS shot
-	// Aim at the middle of the body; when the middle is behind something but the head shows (a mech
-	// behind a roof edge or a low wall), aim at the head instead.
+	// from ahmad-ovh/Buildathon@56e0f76b (MIT): head-aim fallback and cooldown-aware latency
 	headTg := tg
 	headOK := false
 	if tg.mech {
-		headTg.centerZ = tg.centerZ * 1.82 // about 8.2 m on a 9 m body
+		headTg.centerZ = tg.centerZ * 1.82
 		headTg.radius = tg.radius * 0.8
 		headOK = true
 	}
@@ -244,7 +231,6 @@ func (b *Bot) engage(act *proto.Action, tg aimTarget, hasLOS, losRecent bool, hp
 	if gunI >= 0 {
 		gunTg, gunHead := tg, headTg
 		if tg.gunLeadSet {
-			// the lead learned for this opponent applies to the bullet only
 			gunTg.lead, gunTg.leadSet = tg.gunLead, true
 			gunHead.lead, gunHead.leadSet = tg.gunLead, true
 		}
@@ -282,7 +268,6 @@ func (b *Bot) engage(act *proto.Action, tg aimTarget, hasLOS, losRecent bool, hp
 	}
 	d := dist3([3]float64{b.pos[0], b.pos[1], b.pos[2] + b.muzzleH}, [3]float64{tg.pos[0], tg.pos[1], tg.pos[2] + tg.centerZ})
 
-	// --- decide what the torso tracks
 	primary := lasS
 	usingMortarAim := false
 	gunPrimary := false
@@ -304,9 +289,6 @@ func (b *Bot) engage(act *proto.Action, tg aimTarget, hasLOS, losRecent bool, hp
 		}
 	}
 	if morI >= 0 && morS.ok && morS.clear && b.slots[morI].cooldown <= 0.15 && !laserReady {
-		// mortar wants its own (pitched) aim; take it when the shot is promising and other guns are idle
-		// a shell every 2.6 s costs the gun a couple of ticks of aim: worth it whenever the shell is
-		// likely to land (and always when the gun cannot shoot anyway)
 		gunIdle := gunI < 0 || b.slots[gunI].reload > 0 || b.slots[gunI].ammo == 0 || !gunS.clear || d > b.P.GunMaxRange
 		if allowFire && (b.mortarWorth(tg, morS, d) || (gunIdle && morS.dist > 25)) {
 			primary = morS
@@ -322,10 +304,7 @@ func (b *Bot) engage(act *proto.Action, tg aimTarget, hasLOS, losRecent bool, hp
 	if !allowFire && !(lasI >= 0 && b.slots[lasI].charge > 0) {
 		return
 	}
-	// Not allowed to fire but a laser is already charging: it cannot be un-charged (it fires by
-	// itself after the hold time), so the laser section below still runs and lets go on target.
 
-	// --- gun
 	if gunI >= 0 && allowFire {
 		sl := &b.slots[gunI]
 		if sl.ammo <= 0 && sl.reload <= 0 {
@@ -339,7 +318,6 @@ func (b *Bot) engage(act *proto.Action, tg aimTarget, hasLOS, losRecent bool, hp
 		if hasLOS && gunS.clear && sl.ammo > 0 && sl.reload <= 0 && gunS.dist < maxR {
 			ey, ep := b.aimErr(gunS)
 			if !gunPrimary {
-				// the torso is being driven to another weapon's solution: no credit for slew
 				ey = math.Abs(angDiff(gunS.yaw, b.aim[0]))
 				ep = math.Abs(gunS.pitch - b.aim[1])
 			}
@@ -350,15 +328,14 @@ func (b *Bot) engage(act *proto.Action, tg aimTarget, hasLOS, losRecent bool, hp
 			}
 		}
 	}
-	// --- laser
 	if lasI >= 0 {
 		sl := &b.slots[lasI]
 		rng := stat(sl.stats, "range", 280) - 4
 		full := stat(sl.stats, "charge", 0.75)
 		inRange := lasS.dist < rng
 		if sl.charge > 0 {
-			// charging: hold until full (or lethal) and lined up, then let go
 			hold := true
+			// from ahmad-ovh/Buildathon@56e0f76b (MIT): rear/cookoff lethality, early release
 			lasMult := 1.0
 			if b.P.SmartFireV2 && tg.rear {
 				lasMult *= b.mech("rear_mult", 1.5)
@@ -389,7 +366,6 @@ func (b *Bot) engage(act *proto.Action, tg aimTarget, hasLOS, losRecent bool, hp
 	if !allowFire {
 		return
 	}
-	// --- lightning
 	if ligI >= 0 {
 		sl := &b.slots[ligI]
 		rng := stat(sl.stats, "range", 45)
@@ -402,7 +378,6 @@ func (b *Bot) engage(act *proto.Action, tg aimTarget, hasLOS, losRecent bool, hp
 			}
 		}
 	}
-	// --- mortar
 	if morI >= 0 && morS.ok && morS.clear {
 		sl := &b.slots[morI]
 		if sl.cooldown <= 0.05 && usingMortarAim {
@@ -414,17 +389,15 @@ func (b *Bot) engage(act *proto.Action, tg aimTarget, hasLOS, losRecent bool, hp
 	}
 }
 
-// mortarWorth decides whether a shell at this solution is likely to connect.
 func (b *Bot) mortarWorth(tg aimTarget, s shot, d float64) bool {
 	splash := 7.0
 	if i := b.has("mortar"); i >= 0 {
 		splash = stat(b.slots[i].stats, "splash_radius", 7)
 	}
 	if s.dist < splash+b.radius+3 {
-		return false // would hurt us too
+		return false
 	}
 	sp := hyp(tg.vel[0], tg.vel[1])
-	// expected miss distance if the target changes its mind halfway
 	miss := sp * s.tf * 0.5
 	if !tg.mech {
 		miss = sp * s.tf * 0.2
@@ -432,12 +405,10 @@ func (b *Bot) mortarWorth(tg aimTarget, s shot, d float64) bool {
 	return miss < splash*0.75
 }
 
-// idleAim looks along our heading with a slow sweep, or toward the last threat cue.
-func (b *Bot) idleAim(act *proto.Action, heading float64, haveHeading bool) {
+func (b *Bot) idleAim(act *Action, heading float64, haveHeading bool) {
 	yaw := b.aim[0]
 	switch {
 	case b.t < 1.75:
-		// opening: one fast full turn so we know who can see us
 		yaw = b.aim[0] + 0.39
 	case b.t-b.lastWeaponDT < 2.5 || b.t-b.lastNpcDT < 2.5:
 		yaw = b.lastDmgBear
@@ -445,7 +416,6 @@ func (b *Bot) idleAim(act *proto.Action, heading float64, haveHeading bool) {
 		yaw = b.lastSoundB
 	default:
 		b.scanPhase += b.decide
-		// a slow full sweep: the 120 degree wedge covers everything in about four seconds
 		if haveHeading {
 			yaw = heading + 1.9*math.Sin(b.scanPhase*1.3)
 		} else {
@@ -456,10 +426,8 @@ func (b *Bot) idleAim(act *proto.Action, heading float64, haveHeading bool) {
 	act.HasAim = true
 }
 
-// gunDPS estimates our gun damage rate at a distance against a dodging target.
-// gunHitProb is our expected gun hit rate by range. From the captured top-16 matches: with our lead
-// the shot is on the target's real path about 98% of the time under 80 m, 90% at 80-180 m and 83%
-// beyond (they hardly dodge); the 0.6 degree spread then costs a little more with distance.
+// ---- hit and DPS models
+
 func gunHitProb(d float64) float64 {
 	switch {
 	case d < 60:
@@ -474,48 +442,6 @@ func gunHitProb(d float64) float64 {
 	return 0.05
 }
 
-// hitTable interpolates a hit rate over range from (distance, rate) knots.
-func hitTable(d float64, knots [][2]float64) float64 {
-	if d <= knots[0][0] {
-		return knots[0][1]
-	}
-	for i := 1; i < len(knots); i++ {
-		if d <= knots[i][0] {
-			f := (d - knots[i-1][0]) / (knots[i][0] - knots[i-1][0])
-			return knots[i-1][1] + (knots[i][1]-knots[i-1][1])*f
-		}
-	}
-	return knots[len(knots)-1][1]
-}
-
-// Measured in our own real free-for-all matches against the top teams (Sat 21 Nov, 280 of our shots,
-// 250 of theirs at us) and consistent with the whole field's rates: beyond about 100 m a gun shot at
-// a mech that is watching the shooter is a lottery (everyone side-steps during the half second of
-// flight), for us as much as for them.
-var (
-	realMyGun    = [][2]float64{{30, 0.95}, {60, 0.86}, {100, 0.55}, {150, 0.28}, {200, 0.18}, {230, 0.12}}
-	realTheirGun = [][2]float64{{30, 0.92}, {60, 0.78}, {100, 0.57}, {150, 0.32}, {200, 0.15}, {230, 0.10}}
-)
-
-// myGunHit / theirGunHit are the hit-rate models in use (HitModel 0: what we believed before the first
-// real matches, 1: measured).
-func (b *Bot) myGunHit(d float64) float64 {
-	if b.realModel() {
-		return hitTable(d, realMyGun)
-	}
-	return gunHitProb(d)
-}
-
-func (b *Bot) theirGunHit(d float64) float64 {
-	if b.realModel() {
-		return hitTable(d, realTheirGun)
-	}
-	return theirGunHitProb(d)
-}
-
-// theirGunHitProb is how often a typical opponent's gun hits us at a range: measured accuracy of the
-// top-16 bots on targets that do not dodge (98/88/57/41/17% by band), reduced a little at range
-// because we do side-step what we can see coming.
 func theirGunHitProb(d float64) float64 {
 	switch {
 	case d < 40:
@@ -530,7 +456,36 @@ func theirGunHitProb(d float64) float64 {
 	return 0.12
 }
 
-// dps estimates sustained damage per second of a loadout at range d.
+func hitTable(d float64, knots [][2]float64) float64 {
+	if d <= knots[0][0] {
+		return knots[0][1]
+	}
+	for i := 1; i < len(knots); i++ {
+		if d <= knots[i][0] {
+			f := (d - knots[i-1][0]) / (knots[i][0] - knots[i-1][0])
+			return knots[i-1][1] + (knots[i][1]-knots[i-1][1])*f
+		}
+	}
+	return knots[len(knots)-1][1]
+}
+
+var realMyGun = [][2]float64{{30, 0.95}, {60, 0.86}, {100, 0.55}, {150, 0.28}, {200, 0.18}, {230, 0.12}}
+var realTheirGun = [][2]float64{{30, 0.92}, {60, 0.78}, {100, 0.57}, {150, 0.32}, {200, 0.15}, {230, 0.10}}
+
+func (b *Bot) myGunHit(d float64) float64 {
+	if b.realModel() {
+		return hitTable(d, realMyGun)
+	}
+	return gunHitProb(d)
+}
+
+func (b *Bot) theirGunHit(d float64) float64 {
+	if b.realModel() {
+		return hitTable(d, realTheirGun)
+	}
+	return theirGunHitProb(d)
+}
+
 func (b *Bot) dpsOf(gun, laser, light, mortar bool, cubes int, d float64, energyOK bool, gunHit func(float64) float64) float64 {
 	mul := b.cubeDamageMul(cubes)
 	w := b.C.Weapons
@@ -549,17 +504,14 @@ func (b *Bot) dpsOf(gun, laser, light, mortar bool, cubes int, d float64, energy
 		if d < stat(l, "range", 280) {
 			lh := 0.85
 			if b.realModel() {
-				lh = 0.75 // the field's lasers land 73% (most misses are beams stopped by cover)
+				lh = 0.75
 			}
 			total += stat(l, "damage", 315) / (stat(l, "charge", 0.75) + stat(l, "cooldown", 1.65)) * lh
 		}
 	}
 	if light && energyOK {
 		l := w["lightning"]
-		lr := stat(l, "range", 45)
-		if b.P.AntiLightningW > 0 {
-			lr += 6 // cover r=45 candidate and potential lightning_range upgrade
-		}
+		lr := stat(l, "range", 45) + 6
 		if d < lr {
 			total += stat(l, "damage", 60) / stat(l, "cooldown", 0.25)
 		}
@@ -574,7 +526,6 @@ func (b *Bot) dpsOf(gun, laser, light, mortar bool, cubes int, d float64, energy
 }
 
 func (b *Bot) myDPS(d float64) float64 {
-	// our own gun only counts inside the range we actually pull the trigger at
 	gun := b.has("gun") >= 0 && d < b.P.GunMaxRange
 	return b.dpsOf(gun, b.has("laser") >= 0, b.has("lightning") >= 0, b.has("mortar") >= 0, b.o.Self.Cubes, d, b.energy > 15, b.myGunHit)
 }
@@ -589,41 +540,16 @@ func (b *Bot) theirDPS(tr *Track, d float64) float64 {
 	gun := tr.Gun || (!tr.Laser && !tr.Mortar && !tr.Light)
 	laser := tr.Laser
 	if laser {
-		// our lightning shorts their laser for as long as we keep arcing them
 		if li := b.has("lightning"); li >= 0 && b.energy > 20 && d < stat(b.slots[li].stats, "range", 45)-3 {
 			laser = false
 		}
-	}
-	dps := b.dpsOf(gun, laser, tr.Light, tr.Mortar, tr.Cubes, d, true, b.theirGunHit)
-	if b.P.CookoffAware && laser && b.has("mortar") >= 0 {
-		cook := stat(b.C.Weapons["laser"], "cookoff", 0)
-		if cook > 0 && d < stat(b.C.Weapons["laser"], "range", 280) {
-			l := b.C.Weapons["laser"]
-			lh := 0.85
-			if b.realModel() {
-				lh = 0.75
+		// from ahmad-ovh/Buildathon@56e0f76b (MIT): LaserCDTrack, punish window after an enemy laser shot
+		if laser && b.P.LaserCDTrack && !b.ffa && !tr.Charging && tr.LaserFiredT > 0 {
+			cdWin := stat(b.C.Weapons["laser"], "cooldown", 1.65) + stat(b.C.Weapons["laser"], "charge", 0.75) - 0.40
+			if b.t-tr.LaserFiredT < cdWin {
+				laser = false
 			}
-			dps += stat(l, "damage", 315) / (stat(l, "charge", 0.75) + stat(l, "cooldown", 1.65)) * lh * cook * b.cubeDamageMul(tr.Cubes)
 		}
 	}
-	return dps
+	return b.dpsOf(gun, laser, tr.Light, tr.Mortar, tr.Cubes, d, true, b.theirGunHit)
 }
-
-// advantage is (time they need to kill us) / (time we need to kill them); > 1 favours us.
-func (b *Bot) advantage(tr *Track, d float64) float64 {
-	mine := b.myDPS(d)
-	theirs := b.theirDPS(tr, d) * (1 - b.armor)
-	if mine < 1 {
-		return 0
-	}
-	if theirs < 1 {
-		return 10
-	}
-	hp := tr.HP
-	if hp <= 0 {
-		hp = tr.MaxHP
-	}
-	return (b.hp / theirs) / (hp / mine)
-}
-
-var _ = proto.NewAction

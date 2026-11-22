@@ -1,6 +1,1 @@
-__pycache__/
-*.py[cod]
-*.log
-.venv/
-*.exe
-/mechbot
+bin/

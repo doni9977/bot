@@ -1,3 +1,4 @@
-# Doni Mech Royale bot
+# doni bot (Mech Royale)
 
-Build with `docker build --platform linux/amd64 -t doni-bot .`.
+Compiled Go bot for the Builders Buildathon Mech Royale track (`mechfight/1`).
+Built on Apex-Go architecture with full ballistic lead, dynamic cover, 16-heading steering, and late-game zone kiting.

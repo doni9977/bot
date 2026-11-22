@@ -1,28 +1,15 @@
 package bot
 
-import (
-	"math"
+import "math"
 
-	"apexbot/internal/proto"
-)
-
-type cand struct {
-	dx, dy float64
-	boost  bool
-	score  float64
-}
-
-// incoming is an enemy projectile we may have to dodge.
 type incoming struct {
-	mortar   bool
-	pos, vel [3]float64
-	maxT     float64 // seconds until it stops (wall, ground, or explosion)
-	impact   [3]float64
-	dmg      float64
-	splash   float64
+	mortar      bool
+	pos, vel    [3]float64
+	maxT        float64
+	impact      [3]float64
+	dmg, splash float64
 }
 
-// gatherIncoming lists the visible projectiles that could matter to us in the next couple of seconds.
 func (b *Bot) gatherIncoming() []incoming {
 	var out []incoming
 	g := stat(b.C.Weapons["mortar"], "gravity", 22)
@@ -33,11 +20,10 @@ func (b *Bot) gatherIncoming() []incoming {
 			continue
 		}
 		if p.Kind == "mortar" {
-			// integrate the arc to its impact
 			x, y, z := p.Pos[0], p.Pos[1], p.Pos[2]
 			vx, vy, vz := p.Vel[0], p.Vel[1], p.Vel[2]
 			tt := 0.0
-			const h = 0.05
+			const h = 0.05 // from ahmad-ovh/Buildathon@56e0f76b (MIT)
 			hit := false
 			for tt < 7 {
 				nx, ny, nz := x+vx*h, y+vy*h, z+vz*h-0.5*g*h*h
@@ -60,7 +46,6 @@ func (b *Bot) gatherIncoming() []incoming {
 				dmg: stat(b.C.Weapons["mortar"], "splash", 160), splash: splash})
 			continue
 		}
-		// straight shots: ignore those not coming our way
 		rx, ry := b.pos[0]-p.Pos[0], b.pos[1]-p.Pos[1]
 		along := (rx*p.Vel[0] + ry*p.Vel[1]) / sp
 		if along < -3 {
@@ -70,14 +55,13 @@ func (b *Bot) gatherIncoming() []incoming {
 		if d > 330 {
 			continue
 		}
-		// lateral miss distance if nobody moves
 		lat := math.Abs(rx*p.Vel[1]-ry*p.Vel[0]) / math.Max(hyp(p.Vel[0], p.Vel[1]), 1)
 		if lat > 14+b.radius {
 			continue
 		}
 		reach := b.W.Raycast(p.Pos[0], p.Pos[1], p.Pos[2], p.Vel[0]/sp, p.Vel[1]/sp, p.Vel[2]/sp, d+20)
 		if reach < d-b.radius-3 {
-			continue // hits a wall first
+			continue
 		}
 		dmg := stat(b.C.Weapons["gun"], "damage", 45)
 		if p.Kind == "npc" {
@@ -88,32 +72,35 @@ func (b *Bot) gatherIncoming() []incoming {
 	return out
 }
 
-// steerReq is what the strategy layer asks the movement planner for.
 type steerReq struct {
-	wantX, wantY float64                         // desired direction (unit or zero)
-	wantW        float64                         // value of one metre of progress along it
-	boost        bool                            // boosting is desired (not just allowed for dodging)
-	slow         bool                            // we move at charge speed (laser charging)
-	posCost      func(x, y float64) float64      // extra cost of ending up at a position (may be nil)
-	hold         bool                            // prefer standing still when nothing threatens
+	wantX, wantY float64
+	wantW        float64
+	boost        bool
+	slow         bool
+	posCost      func(x, y float64) float64
+	hold         bool
 	threats      []incoming
-	lookTicks    int  // evaluate position costs this many ticks ahead (0: default)
-	dodgeBoost   bool // boosting is worth considering even without projectiles
-	fenceRoof    bool // we are on a roof and mean to stay on it: do not step off the edge
-	zoneFree     bool // we are following a path that takes care of the zone itself
+	lookTicks    int
+	dodgeBoost   bool
+	fenceRoof    bool
+	zoneFree     bool
 }
 
-var dirs16 = func() [16][2]float64 {
-	var d [16][2]float64
-	for i := 0; i < 16; i++ {
-		a := float64(i) * math.Pi / 8
-		d[i] = [2]float64{math.Cos(a), math.Sin(a)}
-	}
-	return d
-}()
+var dirs16 [16][2]float64
 
-// steer evaluates candidate moves by simulating our motion against incoming fire and picks the best.
-func (b *Bot) steer(act *proto.Action, rq steerReq) {
+func init() {
+	for i := 0; i < 16; i++ {
+		dirs16[i] = [2]float64{math.Cos(float64(i) * math.Pi / 8), math.Sin(float64(i) * math.Pi / 8)}
+	}
+}
+
+type cand struct {
+	dx, dy float64
+	boost  bool
+	score  float64
+}
+
+func (b *Bot) steer(act *Action, rq steerReq) {
 	grounded := b.o.Self.Grounded
 	accel := b.mech("ground_accel", 58.5)
 	if !grounded {
@@ -135,7 +122,7 @@ func (b *Bot) steer(act *proto.Action, rq steerReq) {
 			horizon = k
 		}
 	}
-	if horizon > 44 {
+	if horizon > 44 { // from ahmad-ovh/Buildathon@56e0f76b (MIT)
 		horizon = 44
 	}
 	progTick := 6
@@ -146,7 +133,7 @@ func (b *Bot) steer(act *proto.Action, rq steerReq) {
 		}
 	}
 
-	cands := b.scratch[:0]
+	cands := make([]cand, 0, 40)
 	cands = append(cands, cand{0, 0, false, 0})
 	for i := 0; i < 16; i++ {
 		cands = append(cands, cand{dirs16[i][0], dirs16[i][1], false, 0})
@@ -160,13 +147,11 @@ func (b *Bot) steer(act *proto.Action, rq steerReq) {
 			cands = append(cands, cand{cands[i].dx, cands[i].dy, true, 0})
 		}
 	}
+
 	zc, zr := b.o.Zone.Center, b.o.Zone.Radius
 	fence := -1
 	var roofOf []int32
 	var roofDist []int16
-	// A cell is only a wall for us if stepping into it makes things worse than where we stand now:
-	// pressed against a wall (or on a roof's outer cells) our own cell already fails the test, and
-	// treating it as blocked would freeze every candidate.
 	startCell := b.Nav.Index(b.pos[0], b.pos[1])
 	startClear := b.Nav.Clear[startCell]
 	groundLevel := b.onGroundLevel()
@@ -190,15 +175,13 @@ func (b *Bot) steer(act *proto.Action, rq steerReq) {
 		vx, vy := b.vel[0], b.vel[1]
 		score := 0.0
 		blocked := false
-		var px, py float64 // position at the progress tick
+		var px, py float64
 		for k := 1; k <= horizon; k++ {
 			vx, vy = approach2(vx, vy, tvx, tvy, accel*b.dt)
 			nx, ny := x+vx*b.dt, y+vy*b.dt
 			cell := b.Nav.Index(nx, ny)
 			if cell != startCell {
 				if fence >= 0 {
-					// stay on our roof, and off its outermost cells (unless we already stand on one:
-					// then anything that is not further out is fine)
 					if int(roofOf[cell]) != fence || (roofDist[cell] < 2 && roofDist[cell] < startRD) {
 						blocked = true
 						vx, vy = 0, 0
@@ -246,13 +229,10 @@ func (b *Bot) steer(act *proto.Action, rq steerReq) {
 		if horizon < progTick {
 			px, py = x, y
 		}
-		// progress toward the goal
 		score += ((px-b.pos[0])*rq.wantX + (py-b.pos[1])*rq.wantY) * rq.wantW
 		if blocked {
 			score -= 3
 		}
-		// do not side-step out of the zone. Only while we are inside it: once outside, the way back
-		// in may well start by going around something, and a penalty here would pin us in place.
 		if zr > 0 && !rq.zoneFree {
 			dOut := hyp(px-zc[0], py-zc[1]) - zr
 			dNow := hyp(b.pos[0]-zc[0], b.pos[1]-zc[1]) - zr
@@ -264,14 +244,13 @@ func (b *Bot) steer(act *proto.Action, rq steerReq) {
 			score -= rq.posCost(px, py)
 		}
 		if c.boost && !rq.boost {
-			score -= 1.5 // energy is not free
+			score -= 1.5
 		}
 		if c.dx == 0 && c.dy == 0 {
 			if rq.hold {
 				score += 0.6
 			}
 		} else {
-			// mild preference for keeping our heading (less jitter)
 			score += 0.25 * (c.dx*b.lastMove[0] + c.dy*b.lastMove[1])
 		}
 		c.score = score
@@ -279,14 +258,12 @@ func (b *Bot) steer(act *proto.Action, rq steerReq) {
 			best = ci
 		}
 	}
-	b.scratch = cands
 	if best >= 0 {
 		act.Move = [2]float64{cands[best].dx, cands[best].dy}
 		act.Boost = cands[best].boost
 	}
 }
 
-// onGroundLevel reports whether our feet are near the walk-grid surface (not on a roof or in the air).
 func (b *Bot) onGroundLevel() bool {
 	k := b.Nav.Index(b.pos[0], b.pos[1])
 	if b.Nav.Solid[k] {
@@ -295,15 +272,12 @@ func (b *Bot) onGroundLevel() bool {
 	return b.pos[2]-float64(b.Nav.Z[k]) < 3.5
 }
 
-// navDir returns the direction to walk now to reach (gx,gy) along the ground, and the remaining
-// straight-line distance. ok=false when we have no idea how to get there.
 func (b *Bot) navDir(gx, gy float64) (float64, float64, float64, bool) {
 	d := hyp(gx-b.pos[0], gy-b.pos[1])
 	if d < 1.0 {
 		return 0, 0, d, true
 	}
 	if !b.onGroundLevel() {
-		// on a roof or airborne: head straight for the goal and drop off the edge
 		dx, dy := norm2(gx-b.pos[0], gy-b.pos[1])
 		return dx, dy, d, true
 	}
@@ -312,7 +286,6 @@ func (b *Bot) navDir(gx, gy float64) (float64, float64, float64, bool) {
 		dx, dy := norm2(gx-b.pos[0], gy-b.pos[1])
 		return dx, dy, d, true
 	}
-	// the path we hold is for somewhere else (or there is none yet)
 	other := !b.pathSet || hyp(gx-b.pathGoal[0], gy-b.pathGoal[1]) > 5
 	replan := len(b.path) == 0 || other || b.t-b.pathT > 1.6
 	if !replan && b.pathIdx < len(b.path) {
@@ -321,24 +294,17 @@ func (b *Bot) navDir(gx, gy float64) (float64, float64, float64, bool) {
 			replan = true
 		}
 	}
-	// path searches are the most expensive thing we do: never more than about three a second, and
-	// a search that failed or fell short is not repeated for a second. A new goal may search sooner
-	// (but not every decision, in case two goals alternate).
 	gap := 0.35
 	if b.pathBad {
 		gap = 1.0
 	}
-	if other && b.P.PathFix {
+	if other {
 		gap = 0.15
 	}
-	if replan && (b.pathSet || !b.P.PathFix) && b.t-b.pathT < gap {
+	if replan && b.pathSet && b.t-b.pathT < gap {
 		replan = false
 	}
-	if other && !replan && b.P.PathFix {
-		// No search allowed for this goal yet: head straight for it for a moment. It must not be
-		// reported as unreachable on the strength of a path (or a failure) that was for another place:
-		// the caller would cross it off for 40 seconds, and at the first tick of a match that used to
-		// cost us the best weapon near our spawn.
+	if other && !replan {
 		dx, dy := norm2(gx-b.pos[0], gy-b.pos[1])
 		return dx, dy, d, true
 	}
@@ -359,14 +325,12 @@ func (b *Bot) navDir(gx, gy float64) (float64, float64, float64, bool) {
 		return dx, dy, d, false
 	}
 	if b.pathBad {
-		// a partial path: once we stand at its end the goal is out of reach from here
 		lx, ly := b.Nav.Pos(int(b.path[len(b.path)-1]))
 		if hyp(lx-b.pos[0], ly-b.pos[1]) < 4 {
 			dx, dy := norm2(gx-b.pos[0], gy-b.pos[1])
 			return dx, dy, d, false
 		}
 	}
-	// advance past nodes we have reached
 	for b.pathIdx < len(b.path)-1 {
 		px, py := b.Nav.Pos(int(b.path[b.pathIdx]))
 		if hyp(px-b.pos[0], py-b.pos[1]) < 3.2 {
@@ -375,7 +339,6 @@ func (b *Bot) navDir(gx, gy float64) (float64, float64, float64, bool) {
 			break
 		}
 	}
-	// look ahead to the farthest node we can walk straight to
 	tgt := b.pathIdx
 	hi := b.pathIdx + 14
 	if hi > len(b.path)-1 {
@@ -399,10 +362,8 @@ func (b *Bot) navDir(gx, gy float64) (float64, float64, float64, bool) {
 	return dx, dy, d, true
 }
 
-// unstick notices when we push against something without moving and hops out of it.
-func (b *Bot) unstick(act *proto.Action, navigating bool) {
+func (b *Bot) unstick(act *Action, navigating bool) {
 	if !navigating {
-		// strafing, holding or fighting: short moves back and forth are not "stuck"
 		b.stuckFor = 0
 		b.stuckT = b.t
 		b.stuckPos = b.pos
@@ -421,7 +382,6 @@ func (b *Bot) unstick(act *proto.Action, navigating bool) {
 		b.stuckPos = b.pos
 	}
 	if b.stuckFor >= 1.0 && b.t > b.unstickT {
-		// hop and slide sideways for a moment
 		a := b.rng.Float64() * 2 * math.Pi
 		b.unstickDir = [2]float64{math.Cos(a), math.Sin(a)}
 		b.unstickT = b.t + 0.7

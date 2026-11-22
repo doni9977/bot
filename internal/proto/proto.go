@@ -1,9 +1,7 @@
-// Package proto holds the mechfight/1 message types (see protocol.md and mechfight.schema.json).
+// Package proto holds the mechfight/1 message types and the action serializer.
 package proto
 
-import (
-	"strconv"
-)
+import "strconv"
 
 type Hello struct {
 	Type     string `json:"type"`
@@ -172,7 +170,7 @@ type BeamObs struct {
 	Age  float64      `json:"age"`
 }
 
-// Event is the union of every event type; unused fields stay zero / nil.
+// Event is the union of every event type.
 type Event struct {
 	Type    string   `json:"type"`
 	Amount  float64  `json:"amount,omitempty"`
@@ -189,7 +187,7 @@ type Event struct {
 	Reason  string   `json:"reason,omitempty"`
 }
 
-// IDValue is an event id that is a number for most events and a string for "upgrade".
+// IDValue is an event id: a number for most events, a string for "upgrade". Never fails.
 type IDValue struct {
 	Num int
 	Str string
@@ -269,29 +267,24 @@ type Obs struct {
 	Offer       *Offer          `json:"offer"`
 }
 
-// Action is one decision. Pick/Take/Drop use -1 for "not set".
+// Action is one decision; serialized by hand in a fixed order.
 type Action struct {
-	Tick   int
-	Move   [2]float64
-	Boost  bool
-	Jump   bool
-	Aim    [2]float64
-	HasAim bool
-	Fire   [2]bool
-	Reload bool
-	Pick   int
-	Take   int
-	Drop   int
-	Label  string // optional debug label
+	Tick        int
+	Move        [2]float64
+	Boost, Jump bool
+	Aim         [2]float64
+	HasAim      bool
+	Fire        [2]bool
+	Reload      bool
+	Pick, Take  int
+	Drop        int
+	Label       string
 }
 
-// NewAction returns an action with the optional fields unset.
-func NewAction(tick int) Action {
-	return Action{Tick: tick, Pick: -1, Take: -1, Drop: -1}
-}
+func NewAction(tick int) Action { return Action{Tick: tick, Pick: -1, Take: -1, Drop: -1} }
 
 func appendF(b []byte, v float64, prec int) []byte {
-	if v != v || v > 1e15 || v < -1e15 { // NaN/Inf guard: never emit invalid JSON
+	if v != v || v > 1e15 || v < -1e15 {
 		return append(b, '0')
 	}
 	return strconv.AppendFloat(b, v, 'f', prec, 64)
@@ -304,7 +297,6 @@ func appendBool(b []byte, v bool) []byte {
 	return append(b, "false"...)
 }
 
-// AppendJSON serialises the action as one JSON line (without the trailing newline).
 func (a *Action) AppendJSON(b []byte) []byte {
 	b = append(b, `{"tick":`...)
 	b = strconv.AppendInt(b, int64(a.Tick), 10)
@@ -312,7 +304,8 @@ func (a *Action) AppendJSON(b []byte) []byte {
 	b = appendF(b, a.Move[0], 4)
 	b = append(b, ',')
 	b = appendF(b, a.Move[1], 4)
-	b = append(b, `],"boost":`...)
+	b = append(b, ']')
+	b = append(b, `,"boost":`...)
 	b = appendBool(b, a.Boost)
 	b = append(b, `,"jump":`...)
 	b = appendBool(b, a.Jump)
@@ -352,6 +345,16 @@ func (a *Action) AppendJSON(b []byte) []byte {
 		b = strconv.AppendQuoteToASCII(b, lab)
 		b = append(b, '}')
 	}
-	b = append(b, '}')
-	return b
+	return append(b, '}')
+}
+
+// Stat returns m[key], or def if the map is nil or the key is missing.
+func Stat(m map[string]float64, key string, def float64) float64 {
+	if m == nil {
+		return def
+	}
+	if v, ok := m[key]; ok {
+		return v
+	}
+	return def
 }
