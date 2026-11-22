@@ -1,2 +1,14 @@
-target/
-.git/
+.git
+.github
+.gitignore
+arena
+check
+sim
+tools
+tests
+*.pyc
+__pycache__
+*.log
+mechfight.schema.json
+*.md
+!README.md

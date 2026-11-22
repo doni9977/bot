@@ -1,13 +1,14 @@
-FROM rust:1.95@sha256:f49565f188ee00bc2a18dd418183f2c5f23ef7d6e691890517ed341a598f67c3 AS build
+FROM golang:1.26.1-bookworm AS build
 WORKDIR /src
-COPY . .
-RUN cargo build --release --locked \
- && install -m 0755 target/release/automata /automata
+COPY go.mod ./
+COPY cmd/mechbot ./cmd/mechbot
+COPY internal/bot ./internal/bot
+COPY internal/proto ./internal/proto
+COPY internal/world ./internal/world
+ENV CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOFLAGS=-mod=mod GOTOOLCHAIN=local
+RUN go build -trimpath -ldflags="-s -w" -o /out/mechbot ./cmd/mechbot
 
-FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
-COPY --from=build --chmod=0755 /automata /usr/local/bin/automata
-COPY --chmod=0644 bot.json /bot.json
-ENV MECH_PARAMS=/bot.json
+FROM scratch
+COPY --from=build /out/mechbot /mechbot
 USER 65534:65534
-WORKDIR /tmp
-ENTRYPOINT ["/usr/local/bin/automata"]
+ENTRYPOINT ["/mechbot"]
