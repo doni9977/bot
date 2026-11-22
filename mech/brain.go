@@ -7,6 +7,7 @@ import (
 )
 
 const lat = 0.075
+const threatTau = 6.0
 
 type Track struct {
 	MechSeen
@@ -97,56 +98,60 @@ type Brain struct {
 	stickID            int
 	stickAt, loseAt    float64
 	resting            bool
+	thrDmg             map[int][2]float64
 }
 
 type Params struct {
-	RetreatHP  float64
-	RecoverHP  float64
-	GunRange   float64
-	LightRange float64
-	LaserRange float64
-	EngageDist float64
-	FarmNPC    bool
-	Explore    bool
-	Ghost      bool
-	HomeExpo   float64
-	LootRadius float64
-	CrateUntil float64
-	UseDrops   bool
-	Dodge      bool
-	NoMortar   bool
-	Peek       bool
-	LaserFirst bool
-	CrowdHide  bool
-	Vulture    float64
-	Ambush     float64
-	LaserSeek  float64
-	Lethal     bool
-	Alert      float64
-	Shy        float64
-	EarlyHide  float64
-	Evade      bool
-	Odds       float64
-	OddsFlee   float64
-	Practice   bool
-	Stick      float64
-	HPw        float64
-	LowBonus   float64
-	MaxTarget  float64
-	LoseRule   bool
-	FightLoot  float64
-	FarmHP     float64
-	AllFoes    bool
-	CubeGoal   float64
-	Econ       bool
-	LaserUp    bool
-	EconSafe   float64
-	Opening    bool
-	NanoUp     bool
-	Finish     float64
-	FinishHP   float64
-	FinishRush bool
-	Pursue     float64
+	RetreatHP   float64
+	RecoverHP   float64
+	GunRange    float64
+	LightRange  float64
+	LaserRange  float64
+	EngageDist  float64
+	FarmNPC     bool
+	Explore     bool
+	Ghost       bool
+	HomeExpo    float64
+	LootRadius  float64
+	CrateUntil  float64
+	UseDrops    bool
+	Dodge       bool
+	NoMortar    bool
+	Peek        bool
+	LaserFirst  bool
+	CrowdHide   bool
+	Vulture     float64
+	Ambush      float64
+	LaserSeek   float64
+	Lethal      bool
+	Alert       float64
+	Shy         float64
+	EarlyHide   float64
+	Evade       bool
+	Odds        float64
+	OddsFlee    float64
+	Practice    bool
+	Stick       float64
+	HPw         float64
+	LowBonus    float64
+	MaxTarget   float64
+	LoseRule    bool
+	FightLoot   float64
+	FarmHP      float64
+	AllFoes     bool
+	CubeGoal    float64
+	Econ        bool
+	LaserUp     bool
+	EconSafe    float64
+	Opening     bool
+	NanoUp      bool
+	Finish      float64
+	FinishHP    float64
+	FinishRush  bool
+	Pursue      float64
+	ThreatFocus float64
+	RearAvoid   float64
+	LightPad    float64
 }
 
 func DefaultParams() Params {
@@ -167,12 +172,21 @@ func NewBrain(h *Hello, w *World) *Brain {
 	return &Brain{
 		W: w, Cfg: h.Config, Slot: h.Slot, rng: rand.New(rand.NewSource(seed)), P: DefaultParams(),
 		tracks: map[int]*Track{}, npcs: map[int]*Track{}, crates: map[int]*known{}, cubes: map[int]*known{},
-		pickups: map[int]*known{}, bad: map[int]float64{}, strafe: 1, lootID: -1, lastHurt: -100, lastThreatAt: -100,
+		pickups: map[int]*known{}, bad: map[int]float64{}, thrDmg: map[int][2]float64{}, strafe: 1, lootID: -1, lastHurt: -100, lastThreatAt: -100,
 		holdStart: -1,
 	}
 }
 
 func hyp(x, y float64) float64 { return math.Hypot(x, y) }
+
+func (b *Brain) threatRate(id int) float64 {
+	r, ok := b.thrDmg[id]
+	if !ok {
+		return 0
+	}
+	decay := math.Exp(-(b.now - r[1]) / threatTau)
+	return r[0] * decay / threatTau
+}
 
 func angDiff(a, b float64) float64 {
 	d := math.Mod(a-b, 2*math.Pi)
@@ -294,6 +308,14 @@ func (b *Brain) observe(o *Obs) {
 		e := &o.Events[i]
 		switch e.Type {
 		case "damaged":
+			if e.By != nil && e.Weapon != "npc" && e.Weapon != "zone" {
+				id := *e.By
+				r := b.thrDmg[id]
+				b.thrDmg[id] = [2]float64{
+					r[0]*math.Exp(-(now-r[1])/threatTau) + e.Amount,
+					now,
+				}
+			}
 			if e.Weapon == "npc" && e.Bearing != nil {
 				b.npcHurt, b.npcBearing = now, *e.Bearing
 			}
@@ -576,6 +598,9 @@ func (b *Brain) step(o *Obs, act *Action) {
 		}
 		if now-t.HitMe < 4 {
 			s -= 40
+		}
+		if b.P.ThreatFocus > 0 {
+			s -= b.P.ThreatFocus * b.threatRate(t.ID)
 		}
 		if t.Closing > 3 {
 			s -= 15
@@ -1428,6 +1453,28 @@ func (b *Brain) fightMove(o *Obs, tg *Track, seen []*Track, wantLos float64) (fl
 			}
 			if b.W.Clear(b.eye(e), body) {
 				s -= 30
+				if b.P.RearAvoid > 0 {
+					toTarget := math.Atan2(tg.Pos[1]-cy, tg.Pos[0]-cx)
+					toOther := math.Atan2(e.Pos[1]-cy, e.Pos[0]-cx)
+					if math.Abs(angDiff(toOther, toTarget)) > math.Pi/2 {
+						s -= b.P.RearAvoid
+					}
+				}
+			}
+		}
+		if b.P.LightPad > 0 {
+			lightRange := b.Cfg.Weapons["lightning"].Range
+			if lightRange <= 0 {
+				lightRange = 45
+			}
+			lightRange += b.P.LightPad
+			for _, e := range seen {
+				if e != tg && b.now-e.Seen < 2.5 && holds(e.Weapons, "lightning") {
+					d := hyp(e.Pos[0]-cx, e.Pos[1]-cy)
+					if d < lightRange {
+						s -= 2 * (lightRange - d)
+					}
+				}
 			}
 		}
 		s -= b.zonePenalty(&o.Zone, cx, cy)
@@ -1954,6 +2001,9 @@ func squadParams(p Params) Params {
 	p.Lethal = true
 	p.Finish = 20
 	p.FightLoot = 40
+	p.ThreatFocus = 1.5
+	p.RearAvoid = 0
+	p.LightPad = 0
 
 	return p
 }
