@@ -1,1 +1,7 @@
-target/
+/target/
+/research-repos/
+__pycache__/
+*.py[cod]
+*.log
+*.profraw
+.DS_Store
