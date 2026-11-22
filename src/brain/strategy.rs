@@ -240,7 +240,13 @@ impl Brain {
         let farm = !held && self.gear_farm_mode(obs, tgt.as_ref());
         let gear_drop = self.gear_drop_ok(obs, tgt.as_ref());
         let hunt_near = if self.gear_on() { self.gear_near_real(obs) } else { near_mech };
-        let rest = !want_retreat && !held && self.want_rest(obs, &zi, n_att, near_mech, hpf);
+        let near_cube = obs.me.cubes < self.cfg.cubes.stat_cap
+            && self.mem.cubes.iter().any(|c| {
+                !self.mem.blacklisted(c.id, t)
+                    && dist(c.pos, pos) < 35.0
+                    && self.in_play(obs, &zi, c.pos, dist(c.pos, pos))
+            });
+        let rest = !want_retreat && !held && !near_cube && self.want_rest(obs, &zi, n_att, near_mech, hpf);
         if want_retreat || held {
             self.econ.resting = false;
         }
@@ -285,6 +291,10 @@ impl Brain {
             if self.vx.regroup {
                 target = Tgt::None;
             }
+        } else if rest {
+            // Do not walk away from passive regeneration for optional loot or drops.
+            mode = Mode::Retreat;
+            goal = self.cover_goal(obs, world, nav, &zi);
         } else if let Some(d) = vdrop {
             mode = Mode::Drop;
             goal = Goal::Nav { pos: d.0, arrive: (d.1 * 0.3).max(1.0) };
@@ -309,9 +319,6 @@ impl Brain {
             mode = Mode::Loot;
             goal = Goal::Nav { pos: hp, arrive: 1.0 };
             goal_id = id;
-        } else if rest {
-            mode = Mode::Retreat;
-            goal = self.cover_goal(obs, world, nav, &zi);
         } else if let Some(l) = loot.as_ref().filter(|l| l.quick) {
             mode = Mode::Loot;
             goal = Goal::Nav { pos: l.pos, arrive: 1.2 };

@@ -74,7 +74,17 @@ impl Brain {
     pub(crate) fn want_rest(&mut self, obs: &Obs, zi: &ZoneInfo, n_att: usize, near_mech: f64, hpf: f64) -> bool {
         let p = &self.p;
         let t = obs.t;
-        let ok = p.rest_on && !zi.urgent && n_att == 0 && t - self.mem.last_damage_t > 1.0 && near_mech > p.rest_near;
+        // Passive HP regeneration starts only after five seconds without dealing or taking damage.
+        // Wait until that timer can actually run, stay inside the zone, and avoid resting with a
+        // recently visible enemy nearby. The old one-second gate could switch to rest while our
+        // own shots were still resetting the regeneration timer.
+        let quiet_since = self.mem.last_damage_t.max(self.mem.last_dealt_t);
+        let ok = p.rest_on
+            && obs.me.in_zone
+            && !zi.urgent
+            && n_att == 0
+            && t - quiet_since > 5.0
+            && near_mech > p.rest_near;
         let r = if self.econ.resting { ok && hpf < p.rest_exit_hp } else { ok && hpf < p.rest_hp };
         self.econ.resting = r;
         r
