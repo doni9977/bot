@@ -673,6 +673,11 @@ func (b *Brain) step(o *Obs, act *Action) {
 	zoneMust := !me.InZone || now+tNeed+3 >= deadline
 	zoneShould := now+tNeed+14 >= deadline
 
+	finalD, finalTol := 0.0, math.Inf(1)
+	if tweakFinalHold && b.pracOn {
+		finalD, finalTol = b.finalHold(o)
+	}
+
 	escJump := false
 	switch {
 	case b.escape(me, &mx, &my, &boost, &escJump):
@@ -683,6 +688,10 @@ func (b *Brain) step(o *Obs, act *Action) {
 	case b.dodgeShell(o, &mx, &my):
 		boost = me.Energy > 15
 		mode = "dodge"
+	case finalD > finalTol:
+		mx, my = b.travel(me, z.NextCenter[0], z.NextCenter[1])
+		boost = finalD > 4 && me.Energy > 5 && me.Grounded
+		mode = "final"
 	case zoneMust && zdist > 2:
 		mx, my = b.travel(me, zgx, zgy)
 		boost = (!me.InZone || now+tNeed >= deadline) && me.Energy > 5
@@ -765,6 +774,9 @@ func (b *Brain) step(o *Obs, act *Action) {
 			}
 			var bc *Vec3
 			for _, c := range b.cubes {
+				if tweakCubeLevel && c.Pos[2]-b.W.GroundAt(c.Pos[0], c.Pos[1]) > 3.2 && math.Abs(c.Pos[2]-zf) > 2 {
+					continue
+				}
 				if d := hyp(c.Pos[0]-x, c.Pos[1]-y); d < r {
 					r = d
 					cp := c.Pos
@@ -953,11 +965,24 @@ func (b *Brain) step(o *Obs, act *Action) {
 		var gy, gp float64
 		gunOK := false
 		if gun != nil {
-			gy, gp = b.lead(muzzle, tp, tv, gun.Stats.Speed, grounded)
+			if tweakLeadK > 0 && b.pracOn && isMech {
+				t0 := 0.05
+				if gun.Reload <= 0.051 {
+					t0 = 0.05
+				}
+				gy, gp = b.leadK(muzzle, tp, tv, gun.Stats.Speed, grounded, t0, tweakLeadK)
+			} else {
+				gy, gp = b.lead(muzzle, tp, tv, gun.Stats.Speed, grounded)
+			}
 			gunOK = dist <= gun.Stats.Range*0.96
 		}
 
-		dp := Vec3{tp[0] + tv[0]*(lat+0.05), tp[1] + tv[1]*(lat+0.05), tp[2]}
+		laserSlew := tweakLaserSlew && b.pracOn
+		dpT := lat + 0.05
+		if laserSlew {
+			dpT = 0.05
+		}
+		dp := Vec3{tp[0] + tv[0]*dpT, tp[1] + tv[1]*dpT, tp[2]}
 		hy := math.Atan2(dp[1]-muzzle[1], dp[0]-muzzle[0])
 		hp := math.Atan2(dp[2]-muzzle[2], hyp(dp[0]-muzzle[0], dp[1]-muzzle[1]))
 		aim = [2]float64{gy, gp}
@@ -997,7 +1022,17 @@ func (b *Brain) step(o *Obs, act *Action) {
 					if holds(target.Weapons, "mortar") {
 						dmg *= 1 + w.Stats.Cookoff
 					}
-					if dmg*0.8 >= target.HP && math.Abs(angDiff(hy, me.Aim[0])) < tolY*0.9 && math.Abs(hp-me.Aim[1]) < tolP {
+					ey := math.Abs(angDiff(hy, me.Aim[0]))
+					ep := math.Abs(hp - me.Aim[1])
+					if laserSlew {
+						ey = math.Max(0, ey-st.TurnRate*0.05)
+						ep = math.Max(0, ep-st.PitchRate*0.05)
+					}
+					lk := 0.8
+					if tweakLethalK > 0 {
+						lk = tweakLethalK
+					}
+					if dmg*lk >= target.HP && ey < tolY*0.9 && ep < tolP {
 						aim = [2]float64{hy, hp}
 						act.Fire[i] = false
 						break
@@ -1106,6 +1141,10 @@ func (b *Brain) step(o *Obs, act *Action) {
 			act.Drop = &one
 		}
 		break
+	}
+
+	if tweakNoAirBoost && !me.Grounded && mode != "escape" && mode != "dodge" {
+		boost = false
 	}
 
 	act.Move = [2]float64{mx, my}
