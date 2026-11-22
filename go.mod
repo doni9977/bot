@@ -1,3 +1,3 @@
-module mechbot
+module donibot
 
-go 1.26
+go 1.25
